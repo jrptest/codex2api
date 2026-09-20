@@ -105,11 +105,16 @@ import {
   needsUsageReload,
   officialUsdValue,
   supportsOfficialUsage,
+  isWorkspaceCreditHardStop,
 } from "../lib/usageFormat";
 import {
   applyOptionalWorkspaceRouteHeader,
   applyWorkspaceRouteHeader,
 } from "../lib/workspaceRoute";
+import {
+  computeCodexTurnStateTtl,
+  formatCodexTurnStateCountdown,
+} from "../lib/codexTurnState";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -530,12 +535,20 @@ function formatAccessTokenBadge(account: AccountRow): string {
   return account.access_token_type === "codex_at" ? "codex_at" : "AT";
 }
 
-// getCreditBalanceDisplay 返回 credits 积分余额徽标应显示的文本；无余额（或未探测）返回 null。
+// getCreditBalanceDisplay 返回 credits 积分余额徽标应显示的文本；无余额（或未探测、已达硬限制）返回 null。
 function getCreditBalanceDisplay(account: AccountRow): string | null {
-  if (!account.credits_has_credits) return null;
+  if (account.credits_valid === false) return null;
+  if (isWorkspaceCreditHardStop(account) || account.credits_overage_limit_reached) return null;
   if (account.credits_unlimited) return "∞";
+  if (!account.credits_has_credits) return null;
   const balance = (account.credits_balance ?? "").trim();
-  return balance ? balance : null;
+  if (!balance) return "✓"; // 上游隐藏了余额（Team 成员）：有积分但看不到数字
+  const parsed = Number.parseFloat(balance);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return balance;
+  }
+  // 余额已知且为 0：与后端 creditsAvailableLocked 一致，不算可用积分
+  return null;
 }
 
 function getInitialAnalysisVisibility(): boolean {
@@ -1338,7 +1351,9 @@ const AccountTableRow = memo(function AccountTableRow({
                                               ? t(
                                                   "accounts.creditsBalanceUnlimited",
                                                 )
-                                              : t(
+                                              : getCreditBalanceDisplay(account) === "✓"
+                                                ? t("accounts.creditsBalanceAvailable")
+                                                : t(
                                                   "accounts.creditsBalanceBadge",
                                                   {
                                                     balance:
@@ -1888,6 +1903,11 @@ export default function Accounts() {
     useState<CodexFingerprintMode>("off");
   const [editTimezone, setEditTimezone] = useState("");
   const [editTimezoneCustom, setEditTimezoneCustom] = useState(false);
+  // Turn State 强制注入:注入值 + 限定模型(逗号分隔)。仅 Codex 官方账号下发。
+  const [editCodexTurnState, setEditCodexTurnState] = useState("");
+  const [editCodexTurnStateModels, setEditCodexTurnStateModels] = useState("");
+  // 时效倒计时的时钟源:编辑弹窗打开期间每秒推进一次,关闭即停。
+  const [turnStateNow, setTurnStateNow] = useState(() => Date.now());
   // 代理池条目：账号表单里"从代理池选择"下拉的数据源。加载失败静默留空
   // （选择器为空时自动隐藏，不影响手动填代理）。
   const [proxyPool, setProxyPool] = useState<ProxyRow[]>([]);
@@ -2083,6 +2103,8 @@ export default function Accounts() {
   // 开启时成立,所以开关与全局代理都得跟着代理池一起进来。
   const [proxyPoolEnabled, setProxyPoolEnabled] = useState(false);
   const [globalProxyURL, setGlobalProxyURL] = useState("");
+  // Resin 启用时 Codex 账号出站整层改经 Resin,徽章要报 resin 而不是下面任何一层。
+  const [resinEnabled, setResinEnabled] = useState(false);
   // 单个对象且引用稳定:memo 行组件的 props 里不能出现每轮新建的数组/对象,
   // 否则整表 memo 失效(账号页性能优化的既有教训)。
   // 分组用全量而非 codexGroups:后端解析组代理时不看渠道,迁移前挂在别的渠道组里
@@ -2094,8 +2116,9 @@ export default function Accounts() {
         groups: allGroups,
         poolEnabled: proxyPoolEnabled,
         globalProxy: globalProxyURL,
+        resinEnabled,
       }),
-    [proxyPool, allGroups, proxyPoolEnabled, globalProxyURL],
+    [proxyPool, allGroups, proxyPoolEnabled, globalProxyURL, resinEnabled],
   );
   const [lazyMode, setLazyMode] = useState(false);
   const [accountPortalEnabled, setAccountPortalEnabled] = useState(false);
@@ -2241,6 +2264,73 @@ export default function Accounts() {
       </p>
     </div>
   );
+
+  // Turn State 时效:只在编辑弹窗打开且该账号已保存注入值时每秒重算;弹窗关闭清掉 interval。
+  const savedCodexTurnState = editingAccount?.codex_turn_state ?? "";
+  const turnStateTtlVisible =
+    editingAccount !== null &&
+    isCodexOfficialAccount(editingAccount) &&
+    savedCodexTurnState !== "" &&
+    editCodexTurnState === savedCodexTurnState;
+  useEffect(() => {
+    if (!turnStateTtlVisible) return;
+    setTurnStateNow(Date.now());
+    const timer = window.setInterval(() => setTurnStateNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [turnStateTtlVisible]);
+
+  const renderCodexTurnStateTtl = () => {
+    if (!turnStateTtlVisible) return null;
+    const ttl = computeCodexTurnStateTtl(
+      editingAccount?.codex_turn_state_set_at,
+      turnStateNow,
+    );
+    if (ttl.kind === "unknown") {
+      return (
+        <p className="mt-1.5 text-xs text-muted-foreground">
+          {t("accounts.codexTurnStateTtlUnknown")}
+        </p>
+      );
+    }
+    if (ttl.kind === "expired") {
+      return (
+        <div className="mt-1.5 space-y-0.5">
+          <p className="flex items-center gap-1.5 text-xs font-medium text-red-600 dark:text-red-400">
+            <Timer className="size-3.5" />
+            {t("accounts.codexTurnStateTtlExpired")}
+          </p>
+          <p className="text-xs text-muted-foreground">
+            {t("accounts.codexTurnStateTtlExpiredHint")}
+          </p>
+        </div>
+      );
+    }
+    const barColor = ttl.warning ? "bg-amber-500" : "bg-emerald-500";
+    const textColor = ttl.warning
+      ? "text-amber-600 dark:text-amber-400"
+      : "text-emerald-600 dark:text-emerald-400";
+    return (
+      <div className="mt-1.5 space-y-1">
+        <p
+          className={cn(
+            "flex items-center gap-1.5 text-xs font-medium tabular-nums",
+            textColor,
+          )}
+        >
+          <Timer className="size-3.5" />
+          {t("accounts.codexTurnStateTtlRemaining", {
+            time: formatCodexTurnStateCountdown(ttl.remainingMs),
+          })}
+        </p>
+        <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
+          <div
+            className={cn("h-full rounded-full transition-[width]", barColor)}
+            style={{ width: `${Math.round(ttl.ratio * 100)}%` }}
+          />
+        </div>
+      </div>
+    );
+  };
 
   const renderWorkspaceRouteInput = ({
     value = workspaceRouteID,
@@ -2683,6 +2773,7 @@ export default function Accounts() {
         setAccountPortalEnabled(Boolean(settings.public_account_portal_page_enabled));
         setProxyPoolEnabled(Boolean(settings.proxy_pool_enabled));
         setGlobalProxyURL((settings.proxy_url ?? "").trim());
+        setResinEnabled(Boolean(settings.codex_egress?.resin_enabled));
       })
       .catch(() => undefined);
     return () => { cancelled = true; };
@@ -5547,6 +5638,8 @@ export default function Accounts() {
     setEditTimezoneCustom(
       Boolean(account.timezone && !findClaudeTimezoneOption(account.timezone)),
     );
+    setEditCodexTurnState(account.codex_turn_state ?? "");
+    setEditCodexTurnStateModels(account.codex_turn_state_models ?? "");
     setEditTags(account.tags ?? []);
     setEditGroupIds(account.group_ids ?? []);
     setEditOpenAIForm({
@@ -5606,6 +5699,8 @@ export default function Accounts() {
     setEditCodexFingerprintMode("off");
     setEditTimezone("");
     setEditTimezoneCustom(false);
+    setEditCodexTurnState("");
+    setEditCodexTurnStateModels("");
     setEditTags([]);
     setEditGroupIds([]);
     setEditOpenAIForm({
@@ -5767,6 +5862,8 @@ export default function Accounts() {
           ? {
               codex_fingerprint_mode: editCodexFingerprintMode,
               timezone: editTimezone.trim(),
+              codex_turn_state: editCodexTurnState.trim(),
+              codex_turn_state_models: editCodexTurnStateModels.trim(),
             }
           : {}),
       };
@@ -9845,6 +9942,68 @@ export default function Accounts() {
                           </div>
                         ) : null}
 
+                        {/* Turn State 强制注入 */}
+                        {isCodexOfficialAccount(editingAccount) ? (
+                          <div className="rounded-xl border border-border/70 bg-card p-4.5 shadow-2xs hover:border-border/90 transition-colors md:col-span-2">
+                            <div className="flex items-center gap-2 font-semibold text-foreground text-sm">
+                              <Hourglass className="size-4 text-amber-500" />
+                              <span>{t("accounts.codexTurnStateTitle")}</span>
+                            </div>
+                            <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
+                              {t("accounts.codexTurnStateHint")}
+                            </p>
+                            <div className="mt-3">
+                              <div className="flex items-center justify-between mb-2">
+                                <label className="block text-sm font-semibold text-muted-foreground">
+                                  {t("accounts.codexTurnStateValueLabel")}
+                                </label>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  disabled={!editCodexTurnState}
+                                  onClick={() => setEditCodexTurnState("")}
+                                >
+                                  {t("accounts.codexTurnStateClear")}
+                                </Button>
+                              </div>
+                              <textarea
+                                className="w-full min-h-[80px] p-3 border border-input rounded-xl bg-background text-sm resize-y font-mono focus:outline-none focus:ring-2 focus:ring-ring"
+                                placeholder={t(
+                                  "accounts.codexTurnStateValuePlaceholder",
+                                )}
+                                value={editCodexTurnState}
+                                onChange={(
+                                  event: ChangeEvent<HTMLTextAreaElement>,
+                                ) => setEditCodexTurnState(event.target.value)}
+                                rows={3}
+                                spellCheck={false}
+                              />
+                              {renderCodexTurnStateTtl()}
+                            </div>
+                            <div className="mt-3">
+                              <label className="block text-sm font-semibold text-muted-foreground mb-2">
+                                {t("accounts.codexTurnStateModelsLabel")}
+                              </label>
+                              <Input
+                                value={editCodexTurnStateModels}
+                                placeholder={t(
+                                  "accounts.codexTurnStateModelsPlaceholder",
+                                )}
+                                onChange={(
+                                  event: ChangeEvent<HTMLInputElement>,
+                                ) =>
+                                  setEditCodexTurnStateModels(event.target.value)
+                                }
+                                spellCheck={false}
+                              />
+                              <p className="mt-1.5 text-xs text-muted-foreground">
+                                {t("accounts.codexTurnStateModelsHint")}
+                              </p>
+                            </div>
+                          </div>
+                        ) : null}
+
                         {/* 自定义请求头 */}
                         <div className="rounded-xl border border-border/70 bg-card p-4.5 shadow-2xs hover:border-border/90 transition-colors md:col-span-2">
                           {renderCustomHeadersTextarea({
@@ -13623,7 +13782,9 @@ function AccountMobileCard({
                   title={
                     account.credits_unlimited
                       ? t("accounts.creditsBalanceUnlimited")
-                      : t("accounts.creditsBalanceBadge", { balance: creditBalance })
+                      : creditBalance === "✓"
+                        ? t("accounts.creditsBalanceAvailable")
+                        : t("accounts.creditsBalanceBadge", { balance: creditBalance })
                   }
                 >
                   <Coins className="size-3" />

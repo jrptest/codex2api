@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -126,11 +127,11 @@ func dispatchPolicyForModel(model string) auth.DispatchPolicy {
 	return auth.DispatchPolicyStandard
 }
 
-func (h *Handler) withModelCooldownFilter(model string, filter auth.AccountFilter) auth.AccountFilter {
+func (h *Handler) withModelCooldownFilter(ctx context.Context, model string, filter auth.AccountFilter) auth.AccountFilter {
 	if h == nil || h.store == nil {
 		return filter
 	}
-	return h.store.WithModelCooldownFilter(model, filter)
+	return h.store.WithModelCooldownFilterContext(ctx, model, filter)
 }
 
 func (h *Handler) shouldUseWebsocketForHTTP() bool {
@@ -190,6 +191,10 @@ type CodexUsageSyncResult struct {
 	UsageWindowLimitsIgnored bool
 	// Cleared5h 表示本次同步因上游未返回 5h 窗口而清除了本地陈旧 5h 快照（issue #382）。
 	Cleared5h bool
+	// CreditsObserved 表示本次同步观察到了上游 credits 相关响应头。
+	CreditsObserved bool
+	// RateLimitReachedType 记录上游返回的 rate_limit_reached_type。
+	RateLimitReachedType string
 }
 
 type codexRateLimitWindow string
@@ -1517,6 +1522,7 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	populateInternalUsageMetaFromContext(c, input)
 	populateClientIPFromRequest(c, input)
 	populateUserAgentMetaFromRequest(c, input)
+	populateTurnStateTemplateMetaFromRequest(c, input)
 	populateWsAcquireFromRequest(c, input)
 	populateUpstreamTrace(c, input)
 	populateCompactUsageMetaFromRequest(c, input)
@@ -1709,7 +1715,7 @@ func setIngressRequestBodyIfAbsent(c *gin.Context, body []byte) {
 	if c == nil {
 		return
 	}
-	if _, exists := c.Get(ingressRequestBodyContextKey); exists {
+	if value, exists := c.Get(ingressRequestBodyContextKey); exists && value != nil {
 		return
 	}
 	// The request-size middleware already owns this immutable buffer for the
@@ -2755,9 +2761,16 @@ func extractResponseImageGenerationOutput(data []byte, seen map[string]struct{})
 
 func responseOutputItemDoneKey(item gjson.Result) string {
 	if key := strings.TrimSpace(item.Get("id").String()); key != "" {
-		return key
+		// gjson strings borrow the parsed item's storage. Keep only the short
+		// identity, not a second full output JSON through this map key.
+		if len(key) <= 256 {
+			return "id:" + key
+		}
+		sum := sha256.Sum256([]byte(key))
+		return fmt.Sprintf("id-sha256:%x", sum)
 	}
-	return strings.TrimSpace(item.Get("type").String()) + "|" + strings.TrimSpace(item.Raw)
+	sum := sha256.Sum256([]byte(strings.TrimSpace(item.Raw)))
+	return fmt.Sprintf("raw-sha256:%x", sum)
 }
 
 func extractResponseOutputItemDone(data []byte, seen map[string]struct{}) (json.RawMessage, bool) {
@@ -2832,6 +2845,12 @@ func (c *responseOutputCollector) Add(data []byte) bool {
 	if !ok {
 		return false
 	}
+	// Count only newly accepted item identities, not delta/terminal events or
+	// duplicate done frames after a collector has reached exactly its limit.
+	if len(c.seen) > responseOutputCollectorMaxItems {
+		c.clearOverflow()
+		return false
+	}
 	record := responseOutputItemRecord{sequence: c.sequence, raw: raw}
 	c.sequence++
 	if outputIndex := gjson.GetBytes(data, "output_index"); outputIndex.Exists() && outputIndex.Int() >= 0 {
@@ -2846,10 +2865,7 @@ func (c *responseOutputCollector) Add(data []byte) bool {
 		}
 	}
 	if nextBytes > c.limit {
-		c.overflow = true
-		c.indexed = nil
-		c.unindexed = nil
-		c.bytes = 0
+		c.clearOverflow()
 		log.Printf("跳过 Responses 终态 output 重建: output_item.done 累计超过 %d 字节", c.limit)
 		return false
 	}
@@ -2860,6 +2876,16 @@ func (c *responseOutputCollector) Add(data []byte) bool {
 		c.unindexed = append(c.unindexed, record)
 	}
 	return true
+}
+
+const responseOutputCollectorMaxItems = 4096
+
+func (c *responseOutputCollector) clearOverflow() {
+	c.overflow = true
+	c.indexed = nil
+	c.unindexed = nil
+	c.seen = nil
+	c.bytes = 0
 }
 
 func (c *responseOutputCollector) Items() []json.RawMessage {
@@ -3114,6 +3140,7 @@ func (h *Handler) authMiddlewareWithQuotaRead(allowQuotaRead bool) gin.HandlerFu
 	allowAnonymous := h.cfg != nil && h.cfg.AllowAnonymousV1
 	return func(c *gin.Context) {
 		attachUserAgentAudit(c)
+		attachTurnStateTemplateAudit(c)
 		attachWsAcquireAudit(c)
 		attachUpstreamTrace(c, h.store)
 		// 如果没有配置任何密钥
@@ -3917,7 +3944,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	} else {
 		accountFilter = accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
 	}
-	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.withModelCooldownFilter(c.Request.Context(), effectiveModel, accountFilter)
 	if continuationUnavailable {
 		accountFilter = relayOnlyAccountFilter(accountFilter)
 	}
@@ -4109,6 +4136,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
 			readCtx := upstreamResponseReadContext(c.Request.Context(), upstreamCtx, continuousRetryPolicy)
+			upstreamCtx = WithCodexClientModel(upstreamCtx, model)
 			lastUpstreamCancel = upstreamCancel
 			ttftGuard := (*firstTokenTimeoutGuard)(nil)
 			if isStream {
@@ -4373,7 +4401,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			// account-bound turn-state token from an attempt that is not yet known
 			// to be successful.
 			if (!isStream || !continuousRetryBuffersAttempts(continuousRetryPolicy)) && !continuousRetryDeadlineActive(c.Request.Context()) {
-				relayCodexTurnStateResponseHeader(c, affinityKey, account, resp.Header)
+				relayCodexTurnStateResponseHeader(c, affinityKey, account, attemptEffectiveModel, resp.Header)
 			}
 			if isGrokNativeRouteResponse(resp) {
 				downstreamFlusher, _ := c.Writer.(http.Flusher)
@@ -4404,7 +4432,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						return
 					}
 					copyGrokNativeResponseHeaders(c, resp.Header)
-					if commitErr := h.commitResponsesStreamAttempt(c, streamAttempt, affinityKey, account, resp.Header); commitErr != nil {
+					if commitErr := h.commitResponsesStreamAttempt(c, streamAttempt, affinityKey, account, attemptEffectiveModel, resp.Header); commitErr != nil {
 						if isContinuousRetryLocalFailure(commitErr) {
 							outcome = overlayContinuousRetryLocalFailure(outcome, commitErr)
 						} else {
@@ -4534,7 +4562,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					parsed := gjson.ParseBytes(data)
 					eventType := normalizedUpstreamSSEEventType(sseEvent, data)
 					ttftGuard.MarkProgress(eventType)
-					isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
+					isFirstToken := isLooseFirstTokenResult(parsed)
 					if !ttftRecorded && isFirstToken {
 						firstTokenMs = int(time.Since(start).Milliseconds())
 						ttftRecorded = true
@@ -4742,7 +4770,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					return
 				}
 				copyGrokNativeResponseHeaders(c, resp.Header)
-				if commitErr := h.commitResponsesStreamAttempt(c, streamAttempt, affinityKey, account, resp.Header); commitErr != nil {
+				if commitErr := h.commitResponsesStreamAttempt(c, streamAttempt, affinityKey, account, attemptEffectiveModel, resp.Header); commitErr != nil {
 					if isContinuousRetryLocalFailure(commitErr) {
 						outcome = overlayContinuousRetryLocalFailure(outcome, commitErr)
 					} else {
@@ -4886,6 +4914,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
 		readCtx := upstreamResponseReadContext(c.Request.Context(), upstreamCtx, continuousRetryPolicy)
 		upstreamCtx = context.WithValue(upstreamCtx, encryptedContentSessionKey{}, sessionIdentity.affinityID)
+		upstreamCtx = WithCodexClientModel(upstreamCtx, model)
 		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
 		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
 		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
@@ -4901,7 +4930,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 按尝试重算：不同尝试的生效模型/账号可能不同，规则按模型或账号门匹配则结果随之变化。
 		serviceTier = EffectiveRequestedServiceTier(upstreamBody, attemptEffectiveModel, downstreamHeaders, attemptIdentity)
 		// 换号后剥离旧账号铸造的 turn-state 回带,防止跨账号矛盾信号打到上游。
+		upstreamCtx = WithCodexTurnStateAffinityKey(upstreamCtx, affinityKey)
 		guardCodexTurnStateEcho(affinityKey, account, downstreamHeaders)
+		// 292 模板替换/注入：必须在 guard 之后、出站 Execute 之前。
+		ApplyCodexTurnStateTemplate(upstreamCtx, downstreamHeaders, account, attemptEffectiveModel)
 		resp, reqErr := executeHTTPWithContinuousRetryKeepalive(upstreamCtx, func() (*http.Response, error) {
 			return ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		})
@@ -5106,7 +5138,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		if !isStream || !continuousRetryBuffersAttempts(continuousRetryPolicy) {
-			relayCodexTurnStateResponseHeader(c, affinityKey, account, resp.Header)
+			relayCodexTurnStateResponseHeader(c, affinityKey, account, attemptEffectiveModel, resp.Header)
 		}
 		SyncCodexUsageState(h.store, account, resp)
 		// 成功！透传响应并跟踪 TTFT / usage
@@ -5128,9 +5160,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 首 token 前收到不可重试的 response.failed 时置位:中止 SSE 转发、
 		// 不做 transport flush(避免提前提交 200 header),循环外按真实错误码返回 JSON。
 		abortedForHTTPError := false
-		// contentTokenSeen: 是否已出现真正的内容事件（严格判定，与 first_token_mode 无关）。
-		// loose 模式下 codex.rate_limits 等前置事件会置位 ttftRecorded，"首 token 前"
-		// 的失败抑制/真实错误码/事件缓冲决策改用本标志，避免在 loose 部署上失效。
+		// contentTokenSeen: 是否已出现真正的内容事件（严格判定，与宽松首字统计无关）。
+		// 首字统计按宽松口径，codex.rate_limits 等前置事件会置位 ttftRecorded，"首 token 前"
+		// 的失败抑制/真实错误码/事件缓冲决策改用本标志。
 		contentTokenSeen := false
 		var responseJSON []byte
 		var imageLogInfo imageUsageLogInfo
@@ -5205,14 +5237,14 @@ func (h *Handler) Responses(c *gin.Context) {
 
 				// TTFT: 记录第一个实际内容事件的时间
 				ttftGuard.MarkProgress(eventType)
-				isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
+				isFirstToken := isLooseFirstTokenResult(parsed)
 				if !ttftRecorded && isFirstToken {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
-				// contentTokenSeen 用严格判定（与 first_token_mode 无关）：loose 模式下
+				// contentTokenSeen 用严格判定（与宽松首字统计无关）：宽松口径下
 				// codex.rate_limits 等前置事件也会置位 ttftRecorded，若用它做"首 token 前"
-				// 判断，失败抑制/真实错误码/超窗压缩重试在 loose 部署上全部失效。
+				// 判断，失败抑制/真实错误码/超窗压缩重试全部失效。
 				if !contentTokenSeen && isFirstTokenResult(parsed) {
 					contentTokenSeen = true
 				}
@@ -5466,7 +5498,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					imageOutputs = append(imageOutputs, imageOutput)
 				}
 				ttftGuard.MarkProgress(eventType)
-				if !ttftRecorded && isFirstTokenResultForMode(parsed, currentFirstTokenMode()) {
+				if !ttftRecorded && isLooseFirstTokenResult(parsed) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
@@ -5600,7 +5632,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.Release(account)
 				return
 			}
-			if commitErr := h.commitResponsesStreamAttempt(c, streamAttempt, affinityKey, account, resp.Header); commitErr != nil {
+			if commitErr := h.commitResponsesStreamAttempt(c, streamAttempt, affinityKey, account, attemptEffectiveModel, resp.Header); commitErr != nil {
 				if isContinuousRetryLocalFailure(commitErr) {
 					outcome = overlayContinuousRetryLocalFailure(outcome, commitErr)
 				} else {
@@ -5886,7 +5918,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// compact 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 中转账号会命中上游自身的 /responses/compact，使仅接入中转的用户也能压缩（issue #174）。
 	accountFilter := accountFilterForCompactResponsesModelWithOriginal(routingModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
-	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.withModelCooldownFilter(c.Request.Context(), effectiveModel, accountFilter)
 	accountFilter = excludeClaudeAccountsFilter(accountFilter)
 	if continuationUnavailable {
 		accountFilter = relayOnlyAccountFilter(accountFilter)
@@ -6252,6 +6284,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		upstreamEndpointLabel := "/v1/responses/compact"
 		var resp *http.Response
 		var reqErr error
+		guardCodexTurnStateEcho(affinityKey, account, downstreamHeaders)
+		ApplyCodexTurnStateTemplate(c.Request.Context(), downstreamHeaders, account, attemptEffectiveModel)
 		if compactViaResponses {
 			upstreamEndpointLabel = "/v1/responses"
 			resp, reqErr = executeHTTPWithContinuousRetryKeepalive(c.Request.Context(), func() (*http.Response, error) {
@@ -6712,7 +6746,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// /v1/chat/completions 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 翻译后的请求体本身就是 Responses 形态，中转账号直接以 HTTP 转发（issue #181）。
 	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
-	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.withModelCooldownFilter(c.Request.Context(), effectiveModel, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 	accountFilter = excludeClaudeAccountsFilter(accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
@@ -6864,6 +6898,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
 		readCtx := upstreamResponseReadContext(c.Request.Context(), upstreamCtx, continuousRetryPolicy)
 		upstreamCtx = context.WithValue(upstreamCtx, encryptedContentSessionKey{}, sessionIdentity.affinityID)
+		upstreamCtx = WithCodexClientModel(upstreamCtx, model)
 		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
@@ -6894,6 +6929,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if useWebsocket {
 				upstreamBody = stripResponsesImageGenerationTool(codexBody)
 			}
+			upstreamCtx = WithCodexTurnStateAffinityKey(upstreamCtx, affinityKey)
+			guardCodexTurnStateEcho(affinityKey, account, downstreamHeaders)
+			ApplyCodexTurnStateTemplate(upstreamCtx, downstreamHeaders, account, attemptEffectiveModel)
 			resp, reqErr = executeHTTPWithContinuousRetryKeepalive(upstreamCtx, func() (*http.Response, error) {
 				return ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 			})
@@ -7248,7 +7286,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					}
 				}
 				ttftGuard.MarkProgress(eventType)
-				isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
+				isFirstToken := isLooseFirstTokenResult(parsed)
 				if !ttftRecorded && isFirstToken {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
@@ -7401,7 +7439,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				parsed := gjson.ParseBytes(data)
 				eventType := normalizedUpstreamSSEEventType(sseEvent, data)
 				ttftGuard.MarkProgress(eventType)
-				if !ttftRecorded && isFirstTokenResultForMode(parsed, currentFirstTokenMode()) {
+				if !ttftRecorded && isLooseFirstTokenResult(parsed) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
@@ -8450,9 +8488,39 @@ func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 			store.ClearStaleSubscriptionExpiresAt(account)
 		}
 	}
-	result.UsageWindowLimitsIgnored = account.SkipsUsageWindowLimits()
 
 	observation := parseCodexUsageHeaderObservation(resp)
+	rateLimitReachedType := strings.TrimSpace(resp.Header.Get("x-codex-rate-limit-reached-type"))
+	result.RateLimitReachedType = rateLimitReachedType
+	if hasCredits, unlimited, ok := parseCodexCreditsFlagHeaders(resp); ok {
+		result.CreditsObserved = true
+		var balPtr *string
+		if trimmed := strings.TrimSpace(resp.Header.Get("x-codex-credits-balance")); trimmed != "" {
+			balPtr = &trimmed
+		}
+		var overagePtr *bool
+		if raw := strings.TrimSpace(resp.Header.Get("x-codex-credits-overage-reached")); raw != "" {
+			if ov, err := strconv.ParseBool(raw); err == nil {
+				overagePtr = &ov
+			}
+		}
+		if store != nil {
+			store.PersistSparseCreditObservation(account, hasCredits, unlimited, balPtr, overagePtr, rateLimitReachedType)
+		} else {
+			account.ApplySparseCreditsHeaders(hasCredits, unlimited, balPtr, overagePtr, rateLimitReachedType)
+		}
+	} else if rateLimitReachedType != "" || observation.authoritative {
+		// reached-type 是逐响应字段：带用量头的响应没有它就是「未触达」，要把旧的
+		// workspace hard-stop 清掉，否则工作区充值后积分顶替永远回不来。
+		if store != nil {
+			store.PersistRateLimitReachedType(account, rateLimitReachedType)
+		} else {
+			account.SetRateLimitReachedType(rateLimitReachedType)
+		}
+	}
+
+	result.UsageWindowLimitsIgnored = account.SkipsUsageWindowLimits()
+
 	result.Used5hHeaders = observation.w5h.valid
 	usageApplied := false
 	if observation.authoritative {
@@ -8524,6 +8592,26 @@ func parseCodexUsageHeaders(resp *http.Response, account *auth.Account) (float64
 // parseCodexUsageHeaderObservation classifies only windows with a positive,
 // recognizable duration. Used-percent-only partial headers are not authoritative
 // evidence that the optional 5h window disappeared.
+// parseCodexCreditsFlagHeaders 解析 sparse credits 头里的两个布尔。对齐官方客户端：
+// has-credits 与 unlimited 都在且可解析才采纳，否则整组丢弃——缺席头强转成 false
+// 会把 wham 探到的正确快照盖成「没积分」并落库。
+func parseCodexCreditsFlagHeaders(resp *http.Response) (hasCredits, unlimited, ok bool) {
+	rawHas := strings.TrimSpace(resp.Header.Get("x-codex-credits-has-credits"))
+	rawUnlimited := strings.TrimSpace(resp.Header.Get("x-codex-credits-unlimited"))
+	if rawHas == "" || rawUnlimited == "" {
+		return false, false, false
+	}
+	hasCredits, err := strconv.ParseBool(rawHas)
+	if err != nil {
+		return false, false, false
+	}
+	unlimited, err = strconv.ParseBool(rawUnlimited)
+	if err != nil {
+		return false, false, false
+	}
+	return hasCredits, unlimited, true
+}
+
 func parseCodexUsageHeaderObservation(resp *http.Response) codexUsageHeaderObservation {
 	out := codexUsageHeaderObservation{}
 	if resp == nil {

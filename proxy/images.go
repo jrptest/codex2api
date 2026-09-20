@@ -730,27 +730,25 @@ func normalizeImageIntentText(text string) string {
 	if text == "" {
 		return ""
 	}
-	replacer := strings.NewReplacer(
-		"\r", " ",
-		"\n", " ",
-		"\t", " ",
-		"，", " ",
-		"。", " ",
-		"！", " ",
-		"？", " ",
-		"；", " ",
-		"：", " ",
-		",", " ",
-		".", " ",
-		"!", " ",
-		"?", " ",
-		";", " ",
-		":", " ",
-		"\"", " ",
-		"'", " ",
-		"`", " ",
-	)
-	return strings.Join(strings.Fields(replacer.Replace(text)), " ")
+	previousSpace := false
+	for _, r := range text {
+		if isImageIntentPunctuation(r) || (unicode.IsSpace(r) && (r != ' ' || previousSpace)) {
+			return strings.Join(strings.FieldsFunc(text, func(r rune) bool {
+				return unicode.IsSpace(r) || isImageIntentPunctuation(r)
+			}), " ")
+		}
+		previousSpace = r == ' '
+	}
+	return text
+}
+
+func isImageIntentPunctuation(r rune) bool {
+	switch r {
+	case '，', '。', '！', '？', '；', '：', ',', '.', '!', '?', ';', ':', '"', '\'', '`':
+		return true
+	default:
+		return false
+	}
 }
 
 func containsAnyPhrase(text string, phrases []string) bool {
@@ -966,43 +964,9 @@ func stripResponsesImageGenerationCapabilities(body []byte) []byte {
 		}
 	}
 
-	// 2. Responses Lite: input[].additional_tools.tools[]
-	if input := gjson.GetBytes(body, "input"); input.Exists() && input.IsArray() {
-		items := input.Array()
-		keptItems := make([]interface{}, 0, len(items))
-		mutated := false
-		for _, item := range items {
-			if strings.TrimSpace(item.Get("type").String()) != "additional_tools" {
-				keptItems = append(keptItems, item.Value())
-				continue
-			}
-			nested := item.Get("tools")
-			if !nested.Exists() || !nested.IsArray() {
-				keptItems = append(keptItems, item.Value())
-				continue
-			}
-			keptTools, removed := stripImageGenerationToolsFromArray(nested.Array())
-			if !removed {
-				keptItems = append(keptItems, item.Value())
-				continue
-			}
-			mutated = true
-			if len(keptTools) == 0 {
-				// 载体工具全被剥离：移除整个 additional_tools 项。
-				continue
-			}
-			rebuilt, _ := sjson.SetBytes([]byte(item.Raw), "tools", keptTools)
-			var rebuiltVal interface{}
-			if err := json.Unmarshal(rebuilt, &rebuiltVal); err == nil {
-				keptItems = append(keptItems, rebuiltVal)
-			} else {
-				keptItems = append(keptItems, item.Value())
-			}
-		}
-		if mutated {
-			body, _ = sjson.SetBytes(body, "input", keptItems)
-		}
-	}
+	// 2. Responses Lite: only inspect matching carriers. Ordinary conversation
+	// items stay opaque, including when a different carrier must be rewritten.
+	body = stripResponsesInputImageTools(body)
 
 	// 3. tool_choice：仅删显式指向图片工具的选择
 	if choice := gjson.GetBytes(body, "tool_choice"); choice.Exists() {
@@ -1032,6 +996,74 @@ func stripResponsesImageGenerationCapabilities(body []byte) []byte {
 		}
 	}
 	return body
+}
+
+func stripResponsesInputImageTools(body []byte) []byte {
+	// The wildcard admits whitespace around the type, matching the existing
+	// TrimSpace policy, and decodes JSON escapes. It returns only a candidate
+	// carrier rather than copying the entire input just to learn none exists.
+	if !gjson.GetBytes(body, `input.#(type%"*additional_tools*")`).Exists() {
+		return body
+	}
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return body
+	}
+	items := input.Array()
+	var replacements map[int][]byte
+	for index, item := range items {
+		if strings.TrimSpace(item.Get("type").String()) != "additional_tools" {
+			continue
+		}
+		nested := item.Get("tools")
+		if !nested.IsArray() {
+			continue
+		}
+		kept, removed := stripImageGenerationToolsFromArray(nested.Array())
+		if !removed {
+			continue
+		}
+		var replacement []byte
+		if len(kept) > 0 {
+			var err error
+			replacement, err = sjson.SetBytes([]byte(item.Raw), "tools", kept)
+			if err != nil {
+				continue
+			}
+		}
+		if replacements == nil {
+			replacements = make(map[int][]byte)
+		}
+		replacements[index] = replacement
+	}
+	if len(replacements) == 0 {
+		return body
+	}
+	var encoded bytes.Buffer
+	encoded.Grow(len(input.Raw))
+	encoded.WriteByte('[')
+	written := false
+	for index, item := range items {
+		replacement, changed := replacements[index]
+		if changed && replacement == nil {
+			continue
+		}
+		if written {
+			encoded.WriteByte(',')
+		}
+		if changed {
+			encoded.Write(replacement)
+		} else {
+			encoded.WriteString(item.Raw)
+		}
+		written = true
+	}
+	encoded.WriteByte(']')
+	updated, err := sjson.SetRawBytes(body, "input", encoded.Bytes())
+	if err != nil {
+		return body
+	}
+	return updated
 }
 
 func validateImagesModel(model string) error {
@@ -1537,13 +1569,17 @@ func imagePreferredAccountFilter(account *auth.Account) bool {
 // 无指纹分流同样要覆盖两层：否则生图流量既能落到分流组账号上，无指纹的生图请求
 // 又不会被关进分流组，两个方向都跟配置意图相反。
 func (h *Handler) nextImageAccount(c *gin.Context, apiKeyID int64, exclude map[int64]bool, model string, identity requestSessionIdentity) (*auth.Account, string) {
-	preferredFilter := applyAffinityGroupRouting(c, identity, h.withModelCooldownFilter(model, imagePreferredAccountFilter))
+	ctx := context.Background()
+	if c != nil && c.Request != nil {
+		ctx = c.Request.Context()
+	}
+	preferredFilter := applyAffinityGroupRouting(c, identity, h.withModelCooldownFilter(ctx, model, imagePreferredAccountFilter))
 	preferredFilter = h.applyScopeBudgetFilter(c, preferredFilter)
 	account, stickyProxyURL := h.nextAccountForSessionWithFilter("", apiKeyID, exclude, preferredFilter)
 	if account != nil {
 		return account, stickyProxyURL
 	}
-	fallbackFilter := applyAffinityGroupRouting(c, identity, h.withModelCooldownFilter(model, imageCapableAccountFilter))
+	fallbackFilter := applyAffinityGroupRouting(c, identity, h.withModelCooldownFilter(ctx, model, imageCapableAccountFilter))
 	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.applyScopeBudgetFilter(c, fallbackFilter))
 }
 
@@ -1606,7 +1642,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		if sameAccountRetryID > 0 {
 			preferredID := sameAccountRetryID
 			sameAccountRetryID = 0
-			preferredFilter := applyAffinityGroupRouting(c, sessionIdentity, h.withModelCooldownFilter(requestModel, imageCapableAccountFilter))
+			preferredFilter := applyAffinityGroupRouting(c, sessionIdentity, h.withModelCooldownFilter(c.Request.Context(), requestModel, imageCapableAccountFilter))
 			preferredFilter = h.applyScopeBudgetFilter(c, preferredFilter)
 			account = h.store.TakePreferredAccountWithDispatch(preferredID, apiKeyID, nil, preferredFilter, dispatchPolicyForModel(requestModel))
 			if account != nil {
@@ -1629,7 +1665,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
 				return
 			}
-			waitFilter := applyAffinityGroupRouting(c, sessionIdentity, h.withModelCooldownFilter(requestModel, imageCapableAccountFilter))
+			waitFilter := applyAffinityGroupRouting(c, sessionIdentity, h.withModelCooldownFilter(c.Request.Context(), requestModel, imageCapableAccountFilter))
 			var selectionErr error
 			account, stickyProxyURL, selectionErr = h.waitForRetryAccountAvailable(c.Request.Context(), "", apiKeyID, retryExclusions.ForSelection(), h.applyScopeBudgetFilter(c, waitFilter), false, dispatchPolicyForModel(requestModel))
 			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolResponses) {
